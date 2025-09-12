@@ -64,11 +64,6 @@ async def log_requests(request: Request, call_next):
     return response
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
 @app.post("/api/query")
 async def post_query(req: QueryRequest):
     if not req.query or not req.query.strip():
