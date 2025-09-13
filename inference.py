@@ -1,5 +1,4 @@
-# inference.py
-
+# inference.py  -- Responses API + web_search enforced (fail if web unavailable)
 from openai import OpenAI
 import json
 import threading
@@ -7,11 +6,10 @@ import re
 from datetime import datetime
 from config import OPENAI_API_KEY
 import logging
+import traceback
 
-# --- Initialize OpenAI client ---
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Conversation memory (system rules) ---
 conversation = [
     {
         "role": "system",
@@ -20,35 +18,26 @@ conversation = [
 Extract: service type, location, intent from user input.
 Respond based on what you have:
 - Both service+location: Find 5-8 realistic providers, state="complete"
-- Missing service: Ask what service they need, state="need_service"  
+- Missing service: Ask what service they need, state="need_service"
 - Missing location: Ask where they're located, state="need_location"
 - Greeting/chat: Be friendly, redirect to services, state="redirect"
 - Unclear: Ask for clarification, state="error"
 
-For providers: 
-- Generate 5-8 providers by default (minimum 3, maximum 20)
-- Use realistic Pakistani business patterns (names, +92-XXX-XXXXXXX phones, real areas)
-- Ensure no duplicate business names
-- Add "Please verify contact details independently" in details
-- Vary business sizes (established companies, local shops, specialists)
-
 MANDATORY: Return ONLY valid JSON in this EXACT format (no extra text):
 {
   "valid": true,
-  "message": "Natural conversational response",
+  "message": "...",
   "state": "complete|need_service|need_location|redirect|error",
-  "providers": [{"name": "Business Name", "phone": "+92-XXX-XXXXXXX", "details": "Service description. Please verify contact details independently.", "address": "Full address in Pakistan", "location_note": "EXACT|GENERAL|NEARBY", "confidence": "HIGH|MEDIUM|LOW"}],
-  "suggestions": ["short", "service", "types"],
-  "ai_data": {"intent": "detected_intent", "service": "service_type_or_null", "location": "location_or_null", "confidence": 0.9},
+  "providers": [ { "name":"...","phone":"...","details":"... Please verify contact details independently.","address":"...","location_note":"EXACT|GENERAL|NEARBY","confidence":"HIGH|MEDIUM|LOW","source":"https://..." } ],
+  "suggestions": ["..."],
+  "ai_data": {"intent":"...","service":"...","location":"...","confidence":0.9},
   "usage_report": {}
 }"""
     }
 ]
 
-# Lock for safe memory usage
 conversation_lock = threading.Lock()
 
-# Logger
 logger = logging.getLogger("localgpt2.inference")
 logger.setLevel(logging.INFO)
 _h = logging.StreamHandler()
@@ -58,225 +47,348 @@ if not logger.handlers:
 
 
 def detect_provider_count(query: str) -> int:
-    """Detect requested provider count. Default = 5, max = 20."""
-    # Check for specific requests
-    if "load more" in query.lower() or "more providers" in query.lower():
+    q = (query or "").lower()
+    if "load more" in q or "more providers" in q:
         return 10
-    if "all" in query.lower() or "maximum" in query.lower():
+    if "all" in q or "maximum" in q:
         return 20
-    
-    # Look for numbers in query
-    match = re.search(r"\b(\d+)\b", query)
-    if match:
+    m = re.search(r"\b(\d+)\b", q)
+    if m:
         try:
-            num = int(match.group(1))
-            return min(max(num, 3), 20)  # Between 3-20
+            n = int(m.group(1))
+            return min(max(n, 3), 20)
         except Exception:
             return 5
-    return 5  # Default to 5 providers
+    return 5
 
 
 def safe_json_parse(text: str) -> dict:
-    """Extract and parse JSON safely from text output."""
     if not text:
         return {}
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
     try:
         return json.loads(text)
     except Exception:
-        # try to extract JSON block between { }
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start != -1 and end != -1:
+        m = re.search(r"(\{[\s\S]*\})", text)
+        if m:
             try:
-                return json.loads(text[start:end])
+                return json.loads(m.group(1))
             except Exception:
                 return {}
-        return {}
+    return {}
 
 
-def process_query(query: str) -> dict:
-    """Process user query with memory + web search + JSON output."""
+NEAR_ME_PHRASES = [
+    "near me", "nearby", "my area", "around here", "around me", "here in the area",
+    "here", "near us", "nearby us", "close to me", "close by", "in my area",
+    "newar me", "newar", "aroundme", "nearme"
+]
+_NEAR_ME_PATTERNS = [re.compile(r"\b" + re.escape(p) + r"\b", flags=re.I) for p in NEAR_ME_PHRASES]
+
+
+def requests_frontend_location(query: str) -> bool:
+    if not query:
+        return False
+    for pat in _NEAR_ME_PATTERNS:
+        if pat.search(query):
+            return True
+    return False
+
+
+def normalize_provider(p: dict) -> dict:
+    return {
+        "name": str(p.get("name", "")).strip(),
+        "phone": str(p.get("phone", "")).strip(),
+        "details": str(p.get("details", "")).strip(),
+        "address": str(p.get("address", "")).strip(),
+        "location_note": str(p.get("location_note", "GENERAL")).strip(),
+        "confidence": str(p.get("confidence", "LOW")).strip(),
+        "source": str(p.get("source", "")).strip()
+    }
+
+
+def enforce_exact_count(providers: list, desired: int) -> list:
+    if not isinstance(providers, list):
+        providers = []
+    normalized = []
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        entry = normalize_provider(p)
+        normalized.append(entry)
+    if len(normalized) >= desired:
+        return normalized[:desired]
+    padded = normalized.copy()
+    for i in range(len(normalized), desired):
+        padded.append({
+            "name": f"Provider {i+1} (incomplete)",
+            "phone": "",
+            "details": "This entry was added because web results were insufficient. Please verify contact details independently.",
+            "address": "",
+            "location_note": "GENERAL",
+            "confidence": "LOW",
+            "source": ""
+        })
+    return padded
+
+
+def try_web_response(prompt_text: str, model: str = "gpt-4o", max_output_tokens: int = 800, temperature: float = 0.0):
+    attempts = []
+    for tool_type in ("web_search", "web_search_preview"):
+        try:
+            web_tool = {"type": tool_type, "search_context_size": "high"}
+            resp = client.responses.create(
+                model=model,
+                tools=[web_tool],
+                input=[{"role": "user", "content": prompt_text}],
+                max_output_tokens=max_output_tokens,
+                temperature=temperature
+            )
+            raw = getattr(resp, "output_text", None)
+            if not raw:
+                parts = []
+                for item in getattr(resp, "output", []) or []:
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            parts.append(c.get("text", ""))
+                raw = "\n".join(parts)
+            return resp, raw, tool_type
+        except Exception as e:
+            attempts.append((tool_type, repr(e)))
+            logger.debug("try_web_response attempt failed for %s: %s", tool_type, e)
+            continue
+    logger.warning("try_web_response: all attempts failed: %s", attempts)
+    return None, None, None
+
+
+def process_query(query: str, frontend_location: str = None) -> dict:
     global conversation
-
-    logger.info(f"process_query received query: {query}")
+    logger.info("process_query received query: %s", query)
     provider_count = detect_provider_count(query)
 
-    # Trim conversation to save tokens + append user message  
     with conversation_lock:
-        if len(conversation) > 7:  # Keep system message + last 6 exchanges
+        if len(conversation) > 7:
             conversation = [conversation[0]] + conversation[-6:]
         conversation.append({"role": "user", "content": query})
 
-    # Call OpenAI API with better model for JSON formatting
-    logger.info(f"About to call OpenAI API with provider_count: {provider_count}")
-    response = client.chat.completions.create(
-        model="gpt-4o-2024-08-06",  # Latest GPT-4o model with reliable JSON formatting
-        messages=conversation,
-        response_format={"type": "json_object"},
-        max_tokens=2000,  # More tokens for detailed provider information
-        temperature=0.2  # Lower temperature for more consistent, realistic output
+    parse_prompt = (
+        "Use live web search results to extract and return ONLY valid JSON with keys: "
+        "ai_data, state, message, suggestions, providers. "
+        "ai_data must contain: intent, service, location, confidence, count. "
+        f"User: {query}\n"
+        "Return ONE JSON object only."
     )
-    
-    logger.info(f"OpenAI API returned. Model: {response.model}")
-    logger.info(f"Usage - Input: {response.usage.prompt_tokens}, Output: {response.usage.completion_tokens}, Total: {response.usage.total_tokens}")
-    logger.info(f"Raw response content: {response.choices[0].message.content}")  # Full response for debugging
 
-    # Parse output safely with detailed logging
-    try:
-        output_json = json.loads(response.choices[0].message.content)
-        logger.info("Successfully parsed JSON response")
-        logger.info(f"Parsed JSON keys: {list(output_json.keys())}")
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {e}")
-        logger.info("Attempting fallback JSON extraction...")
-        output_json = safe_json_parse(response.choices[0].message.content)
-        if output_json:
-            logger.info("Fallback JSON extraction successful")
-        else:
-            logger.error("Fallback JSON extraction failed")
-    except Exception as e:
-        logger.error(f"Unexpected error parsing JSON: {e}")
-        output_json = None
-        
-    if not output_json:
-        logger.warning("Creating fallback response due to JSON parsing failure")
-        output_json = {
+    parse_resp_obj, parse_raw, parse_tool = try_web_response(parse_prompt, model="gpt-4o", max_output_tokens=800, temperature=0.0)
+
+    parsed = {}
+    if not parse_resp_obj or not parse_raw:
+        result = {
             "valid": False,
-            "message": "I'm having trouble processing that request. Please try rephrasing.",
+            "message": "Web search tool unavailable or parse step failed — cannot return real web-sourced providers.",
             "state": "error",
             "providers": [],
-            "suggestions": ["plumber", "electrician"],
+            "suggestions": [],
+            "ai_data": {"intent": None, "service": None, "location": None, "confidence": 0.0},
+            "usage_report": {
+                "error": "web_tool_unavailable_or_parse_failed",
+                "attempted_tools": ["web_search", "web_search_preview"],
+                "timestamp": datetime.now().isoformat()
+            }
+        }
+        try:
+            with conversation_lock:
+                conversation.append({"role": "assistant", "content": json.dumps(result)})
+        except Exception:
+            pass
+        return result
+
+    parsed = safe_json_parse(parse_raw)
+    if not isinstance(parsed, dict) or not parsed.get("ai_data"):
+        svc = None
+        msvc = re.search(r"\b(plumber|electrician|carpenter|mechanic|doctor|dentist|lawyer|cleaner|painter|roofer|locksmith|hvac|pest)\b", (query or "").lower())
+        if msvc:
+            svc = msvc.group(1)
+        mloc = re.search(r"\b(?:in|at|near|around)\s+([A-Za-z0-9 .,\-']{2,60})", (query or ""), flags=re.I)
+        loc = mloc.group(1).strip().strip(".,") if mloc else None
+        parsed = {
             "ai_data": {
-                "intent": "error",
-                "service": None,
-                "location": None,
-                "confidence": 0.0,
+                "intent": "find_service" if svc else None,
+                "service": svc,
+                "location": loc,
+                "confidence": 0.6 if svc else 0.0,
+                "count": provider_count
             },
-            "usage_report": {}
+            "state": "complete" if svc and loc else ("need_service" if not svc else "need_location"),
+            "message": "",
+            "suggestions": ["plumber", "electrician"] if not svc else [],
+            "providers": []
         }
 
-    # Memory: carry forward missing service/location
+    ai_data = parsed.setdefault("ai_data", {})
+    ai_data["count"] = int(ai_data.get("count") or provider_count)
+
+    used_frontend = False
+
+    loc_from_ai = ai_data.get("location")
+    if isinstance(loc_from_ai, str) and re.search(r'\b(near|nearby|here|around)\b', loc_from_ai.lower()):
+        wants_frontend = True
+    else:
+        wants_frontend = requests_frontend_location(query)
+
+    if wants_frontend and frontend_location:
+    # User said "near me" and we have frontend location
+        ai_data["location"] = frontend_location
+        parsed["state"] = "complete" if ai_data.get("service") else "need_service"
+        used_frontend = True
+    elif ai_data.get("location"):
+    # Location explicitly given in user input
+        parsed["state"] = "complete" if ai_data.get("service") else "need_service"
+    else:
+    # No location info at all
+        parsed["state"] = "need_location"
+        ai_data["location"] = None
+
+
     with conversation_lock:
         for msg in reversed(conversation):
             if msg["role"] == "assistant":
                 try:
-                    past_data = json.loads(msg["content"])
-                    past_service = past_data.get("ai_data", {}).get("service")
-                    past_location = past_data.get("ai_data", {}).get("location")
-
-                    if not output_json.get("ai_data", {}).get("service") and past_service:
-                        output_json.setdefault("ai_data", {})["service"] = past_service
-                    if not output_json.get("ai_data", {}).get("location") and past_location:
-                        output_json.setdefault("ai_data", {})["location"] = past_location
+                    past = json.loads(msg["content"])
+                    past_ai = past.get("ai_data", {})
+                    if not ai_data.get("service") and past_ai.get("service"):
+                        ai_data["service"] = past_ai.get("service")
+                    if not ai_data.get("location") and past_ai.get("location") and not used_frontend:
+                        ai_data["location"] = past_ai.get("location")
                 except Exception:
                     pass
                 break
 
-    # Ensure provider count
-    if output_json.get("state") == "complete":
-        providers = output_json.get("providers", [])
-        if isinstance(providers, list) and len(providers) < provider_count:
-            service = output_json["ai_data"].get("service")
-            location = output_json["ai_data"].get("location")
+    parsed["ai_data"] = ai_data
 
-            provider_prompt = f"""
-            Generate exactly {provider_count} unique {service} providers in {location}, Pakistan.
-            
-            Requirements:
-            - All business names must be different and realistic
-            - Use Pakistani phone format: +92-XX-XXXXXXX or 0XXX-XXXXXXX
-            - Include variety: established companies, local shops, specialists
-            - Real-sounding addresses in {location}
-            - Add "Please verify contact details independently" in details
-            
-            Return ONLY a JSON object with "providers" array:
-            {{"providers": [{{"name": "...", "phone": "...", "details": "...", "address": "...", "location_note": "EXACT", "confidence": "HIGH"}}]}}
-            """
+    if parsed.get("state") == "complete":
+        service = ai_data.get("service")
+        location = ai_data.get("location")
+        desired = int(ai_data.get("count") or provider_count)
 
-            provider_resp = client.chat.completions.create(
-                model="gpt-4o-2024-08-06",  # Same reliable model for consistency
-                messages=[{"role": "user", "content": provider_prompt}],
-                response_format={"type": "json_object"},
-                max_tokens=1500,
-                temperature=0.2
-            )
-
-            new_providers_data = safe_json_parse(provider_resp.choices[0].message.content)
-            if isinstance(new_providers_data, dict) and "providers" in new_providers_data:
-                new_providers = new_providers_data["providers"]
-                if isinstance(new_providers, list) and len(new_providers) > 0:
-                    output_json["providers"] = new_providers
-
-    # Calculate provider count first (needed for usage report)
-    providers_count = len(output_json.get("providers") or [])
-
-    # Add usage report with current GPT-4o-2024-08-06 pricing
-    try:
-        input_tokens = response.usage.prompt_tokens
-        output_tokens = response.usage.completion_tokens
-        total_tokens = input_tokens + output_tokens
-
-        # GPT-4o-2024-08-06 pricing (as of Sept 2025)
-        # Input: $5.00 per 1M tokens = $0.005 per 1K tokens
-        # Output: $15.00 per 1M tokens = $0.015 per 1K tokens
-        input_cost_per_1k = 0.005  # $5.00 per 1M input tokens
-        output_cost_per_1k = 0.015   # $15.00 per 1M output tokens
-        cost = (input_tokens / 1000 * input_cost_per_1k) + (
-            output_tokens / 1000 * output_cost_per_1k
+        provider_prompt = (
+            f"Using up-to-date web search results, return ONLY valid JSON with key 'providers' containing exactly {desired} unique real providers.\n"
+            f"Service: {service}\nLocation: {location}\n\n"
+            "Important: Only include providers physically located in the specified location. "
+            "Do NOT include providers from Pakistan unless the user explicitly asked for Pakistan.\n\n"
+            "For each provider include keys: name, phone, details, address, location_note (EXACT|GENERAL), confidence (HIGH|MEDIUM|LOW), source (URL).\n"
+            "Requirements:\n"
+            " - Use ONLY information directly verifiable on live web pages (the web search tool will be used).\n"
+            " - Include the source URL in the 'source' field for each provider. Do NOT fabricate sources.\n"
+            " - If a field is unavailable, set it to an empty string.\n"
+            " - Ensure each 'details' ends with 'Please verify contact details independently.'\n\n"
+            "Return exactly one top-level JSON object and nothing else."
         )
 
-        usage_report = {
-            "model": response.model,
-            "tokens": {
-                "input": input_tokens,
-                "output": output_tokens,
-                "total": total_tokens
-            },
-            "cost": {
-                "input_cost": round(input_tokens / 1000 * input_cost_per_1k, 6),
-                "output_cost": round(output_tokens / 1000 * output_cost_per_1k, 6),
-                "total_cost": round(cost, 6)
-            },
-            "pricing": {
-                "input_per_1k": input_cost_per_1k,
-                "output_per_1k": output_cost_per_1k,
-                "currency": "USD"
-            },
-            "timestamp": datetime.now().isoformat(),
-            "query": query[:50] + "..." if len(query) > 50 else query,
-            "provider_count": providers_count
-        }
-        
-        output_json["usage_report"] = usage_report
-        logger.info(f"Usage analytics: {json.dumps(usage_report, indent=2)}")
-    except Exception as e:
-        logger.error(f"Failed to create usage report: {e}")
-        output_json.setdefault("usage_report", {})
 
-    # Save assistant reply to memory
+        prov_resp_obj, prov_raw, prov_tool = try_web_response(provider_prompt, model="gpt-4o", max_output_tokens=1500, temperature=0.1)
+
+        if not prov_resp_obj or not prov_raw:
+            result = {
+                "valid": False,
+                "message": "Provider generation failed or web search tool unavailable — cannot return real providers.",
+                "state": "error",
+                "providers": [],
+                "suggestions": [],
+                "ai_data": ai_data,
+                "usage_report": {
+                    "error": "provider_generation_failed_or_no_web_tool",
+                    "attempted_tools": ["web_search", "web_search_preview"],
+                    "timestamp": datetime.now().isoformat()
+                }
+            }
+            try:
+                with conversation_lock:
+                    conversation.append({"role": "assistant", "content": json.dumps(result)})
+            except Exception:
+                pass
+            return result
+
+        new_data = safe_json_parse(prov_raw)
+        if not isinstance(new_data, dict) or not isinstance(new_data.get("providers"), list):
+            result = {
+                "valid": False,
+                "message": "Provider generation returned unparsable or missing 'providers' — aborting to avoid fabricated data.",
+                "state": "error",
+                "providers": [],
+                "suggestions": [],
+                "ai_data": ai_data,
+                "usage_report": {
+                    "error": "provider_generation_unparseable",
+                    "raw": prov_raw[:1000],
+                    "timestamp": datetime.now().isoformat()
+                }
+            }
+            try:
+                with conversation_lock:
+                    conversation.append({"role": "assistant", "content": json.dumps(result)})
+            except Exception:
+                pass
+            return result
+
+        providers = [normalize_provider(p) for p in new_data.get("providers", [])]
+        missing_source = any(not p.get("source") for p in providers)
+        if missing_source:
+            result = {
+                "valid": False,
+                "message": "Provider results lacked source URLs for one or more entries — refusing to return unverified providers.",
+                "state": "error",
+                "providers": [],
+                "suggestions": [],
+                "ai_data": ai_data,
+                "usage_report": {
+                    "error": "missing_sources_in_providers",
+                    "raw_providers_sample": providers[:3],
+                    "timestamp": datetime.now().isoformat()
+                }
+            }
+            try:
+                with conversation_lock:
+                    conversation.append({"role": "assistant", "content": json.dumps(result)})
+            except Exception:
+                pass
+            return result
+
+        parsed_providers = enforce_exact_count(providers, desired)
+        parsed["providers"] = parsed_providers
+        parsed["state"] = "complete"
+    else:
+        parsed.setdefault("providers", [])
+        parsed["state"] = parsed.get("state", "error")
+
+    result = {
+        "valid": True,
+        "message": parsed.get("message", f"Here are {ai_data.get('count')} providers.") if isinstance(parsed, dict) else "",
+        "state": parsed.get("state", "error"),
+        "providers": parsed.get("providers", []),
+        "suggestions": parsed.get("suggestions", []),
+        "ai_data": parsed.get("ai_data", {"intent": None, "service": None, "location": None, "confidence": 0.0}),
+        "usage_report": {
+            "parse_tool_used": parse_resp_obj and getattr(parse_resp_obj, "model", None),
+            "provider_tool_used": prov_resp_obj and getattr(prov_resp_obj, "model", None),
+            "timestamp": datetime.now().isoformat()
+        }
+    }
+
     try:
         with conversation_lock:
-            conversation.append(
-                {"role": "assistant", "content": json.dumps(output_json)}
-            )
+            conversation.append({"role": "assistant", "content": json.dumps(result)})
     except Exception:
         pass
 
-    logger.info(
-        f"process_query result: valid={output_json.get('valid')} "
-        f"state={output_json.get('state')} providers={providers_count} "
-        f"query='{query[:50]}...'"
-    )
-
-    return output_json
+    return result
 
 
 if __name__ == "__main__":
     while True:
         query = input("You: ")
         if query.lower() in ["exit", "quit"]:
-            print("Ending conversation.")
             break
-
-        result = process_query(query)
+        frontend_location = None
+        result = process_query(query, frontend_location=frontend_location)
         print(json.dumps(result, indent=2, ensure_ascii=False))
