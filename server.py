@@ -81,7 +81,7 @@ async def post_query(req: QueryRequest):
             # Pass query + frontend_location to process_query
             result = await asyncio.wait_for(
                 asyncio.to_thread(process_query, req.query, frontend_location),
-                timeout=30.0
+                timeout=60.0
             )
         except asyncio.TimeoutError:
             logger.error("process_query timed out")
