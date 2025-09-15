@@ -21,6 +21,7 @@ if not logger.handlers:
 
 class QueryRequest(BaseModel):
     query: str
+    city: Optional[str] = None
 
 
 app = FastAPI(title="localgpt2-server", version="0.2")
@@ -70,18 +71,25 @@ async def post_query(req: QueryRequest):
         raise HTTPException(status_code=400, detail="query is required")
 
     try:
-        # process_query is blocking; run it in a thread to avoid blocking the event loop
         logger.info(f"Processing query (endpoint): {req.query}")
+        frontend_location = req.city if req.city else None  # 👈 map city to frontend_location
+        if frontend_location:
+            logger.info(f"User city (frontend_location): {frontend_location}")
+
         try:
-            # run with timeout to prevent long blocking
-            result = await asyncio.wait_for(asyncio.to_thread(process_query, req.query), timeout=30.0)
+            # Pass query + frontend_location to process_query
+            result = await asyncio.wait_for(
+                asyncio.to_thread(process_query, req.query, frontend_location),
+                timeout=30.0
+            )
         except asyncio.TimeoutError:
             logger.error("process_query timed out")
             raise HTTPException(status_code=504, detail="processing timeout")
-            
+
         # Log complete analytics
         logger.info("=== ANALYTICS ===")
         logger.info(f"Query: {req.query}")
+        logger.info(f"frontend_location: {frontend_location}")
         logger.info(f"Result keys: {list(result.keys())}")
         logger.info(f"State: {result.get('state')}")
         logger.info(f"Valid: {result.get('valid')}")
@@ -89,7 +97,7 @@ async def post_query(req: QueryRequest):
         logger.info(f"Usage report: {result.get('usage_report', {})}")
         logger.info(f"Complete JSON response: {json.dumps(result, indent=2, ensure_ascii=False)}")
         logger.info("=== END ANALYTICS ===")
-        
+
         logger.info(f"Processed result for query: {req.query} -> keys={list(result.keys())}")
     except Exception as e:
         logger.exception("Error while processing query")
