@@ -28,7 +28,7 @@ MANDATORY: Return ONLY valid JSON in this EXACT format (no extra text):
   "valid": true,
   "message": "...",
   "state": "complete|need_service|need_location|redirect|error",
-  "providers": [ { "name":"...","phone":"...","details":"... Please verify contact details independently.","address":"...","location_note":"EXACT|GENERAL|NEARBY","confidence":"HIGH|MEDIUM|LOW","source":"https://..." } ],
+  "providers": [ { "name":"...","phone":"...","details":"... Please verify contact details independently.","address":"...","location_note":"EXACT|GENERAL|NEARBY","confidence":"HIGH|MEDIUM|LOW" } ],
   "suggestions": ["..."],
   "ai_data": {"intent":"...","service":"...","location":"...","confidence":0.9},
   "usage_report": {}
@@ -102,8 +102,7 @@ def normalize_provider(p: dict) -> dict:
         "details": str(p.get("details", "")).strip(),
         "address": str(p.get("address", "")).strip(),
         "location_note": str(p.get("location_note", "GENERAL")).strip(),
-        "confidence": str(p.get("confidence", "LOW")).strip(),
-        "source": str(p.get("source", "")).strip()
+        "confidence": str(p.get("confidence", "LOW")).strip(),    
     }
 
 
@@ -127,7 +126,6 @@ def enforce_exact_count(providers: list, desired: int) -> list:
             "address": "",
             "location_note": "GENERAL",
             "confidence": "LOW",
-            "source": ""
         })
     return padded
 
@@ -276,14 +274,14 @@ def process_query(query: str, frontend_location: str = None) -> dict:
             f"Service: {service}\nLocation: {location}\n\n"
             "Important: Only include providers physically located in the specified location. "
             "Do NOT include providers from Pakistan unless the user explicitly asked for Pakistan.\n\n"
-            "For each provider include keys: name, phone, details, address, location_note (EXACT|GENERAL), confidence (HIGH|MEDIUM|LOW), source (URL).\n"
+            "For each provider include keys: name, phone, details, address, location_note (EXACT|GENERAL), confidence (HIGH|MEDIUM|LOW).\n"
             "Requirements:\n"
             " - Use ONLY information directly verifiable on live web pages (the web search tool will be used).\n"
-            " - Include the source URL in the 'source' field for each provider. Do NOT fabricate sources.\n"
             " - If a field is unavailable, set it to an empty string.\n"
             " - Ensure each 'details' ends with 'Please verify contact details independently.'\n\n"
             "Return exactly one top-level JSON object and nothing else."
         )
+
 
 
         prov_resp_obj, prov_raw, prov_tool = try_web_response(provider_prompt, model="gpt-4o", max_output_tokens=1500, temperature=0.1)
