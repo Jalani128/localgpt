@@ -45,17 +45,22 @@ _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message
 if not logger.handlers:
     logger.addHandler(_h)
 
-# ---------- Phone & location helpers (added) ----------
+# ---------- Phone & location helpers ----------
 
 _COUNTRY_HINTS = {
     # Pakistan + major cities/regions
     "pakistan": "+92", "peshawar": "+92", "khyber pakhtunkhwa": "+92",
     "karachi": "+92", "lahore": "+92", "islamabad": "+92", "rawalpindi": "+92",
-    # A few common others (best-effort; safe fallbacks)
-    "india": "+91", "delhi": "+91", "mumbai": "+91",
-    "united arab emirates": "+971", "uae": "+971", "dubai": "+971", "abu dhabi": "+971",
-    "united states": "+1", "usa": "+1", "new york": "+1", "los angeles": "+1",
+    # India
+    "india": "+91", "mumbai": "+91", "delhi": "+91",
+    # USA
+    "united states": "+1", "usa": "+1", "new york": "+1", "los angeles": "+1", "texas": "+1",
+    # UK
     "united kingdom": "+44", "uk": "+44", "london": "+44",
+    # UAE
+    "united arab emirates": "+971", "uae": "+971", "dubai": "+971", "abu dhabi": "+971",
+    # Morocco
+    "morocco": "+212", "casablanca": "+212",
 }
 
 def _infer_country_code(location_hint: str) -> str | None:
@@ -75,46 +80,70 @@ def _normalize_phone_e164(raw: str, location_hint: str = "") -> str:
     # Keep only + and digits first
     kept = re.sub(r"[^\d+]", "", s)
 
-    # Already in +CC... form
+    # Already +CC...
     if kept.startswith("+"):
         return "+" + re.sub(r"[^\d]", "", kept)
 
-    # Handle 00CC...
+    # 00CC...
     if kept.startswith("00"):
         return "+" + re.sub(r"[^\d]", "", kept[2:])
 
-    # From here we have digits without a '+'
+    # Bare digits
     digits = re.sub(r"\D", "", kept)
     if not digits:
         return ""
 
     cc = _infer_country_code(location_hint)
 
-    # If we can guess CC, convert local formats like 03xx... to +92 3xx...
+    # Apply simple rules for common cases
     if cc:
-        # If number already begins with the country code (e.g., 92...), add '+'
-        if cc == "+92" and digits.startswith("92"):
+        # If already starts with CC digits, just add '+'
+        if (cc == "+92" and digits.startswith("92")) or \
+           (cc == "+91" and digits.startswith("91")) or \
+           (cc == "+971" and digits.startswith("971")) or \
+           (cc == "+44" and digits.startswith("44")):
             return "+" + digits
-        if cc == "+91" and digits.startswith("91"):
-            return "+" + digits
-        if cc == "+971" and digits.startswith("971"):
-            return "+" + digits
-        if cc == "+44" and digits.startswith("44"):
-            return "+" + digits
-        if cc == "+1" and digits.startswith("1") and len(digits) in (10, 11):
-            # 1xxxxxxxxxx (11) -> +1xxxxxxxxxx, or xxxxxxxxxx (10) -> +1xxxxxxxxxx
-            if len(digits) == 11:
+        if cc == "+1":
+            # 1XXXXXXXXXX (11) or XXXXXXXXXX (10)
+            if len(digits) == 11 and digits.startswith("1"):
                 return "+" + digits
-            return "+1" + digits
-
-        # Common local style starting with 0 (e.g., Pakistan mobile 03xx...)
+            if len(digits) == 10:
+                return "+1" + digits
+        # Common local leading 0
         if digits.startswith("0"):
             digits = digits.lstrip("0")
+        return cc + digits
 
-        return cc + digits  # e.g., +92 + 3339136477 -> +923339136477
-
-    # Fallback: no location hint — at least prefix '+' so it's "international-like"
+    # Fallback: no hint; prefix '+'
     return "+" + digits
+
+def extract_explicit_location_from_query(query: str) -> str | None:
+    """
+    Extracts an explicit user-provided location (city/region/country) from the prompt.
+    We treat 'near me/around me/here' as NOT an explicit location.
+    """
+    if not query:
+        return None
+    q = " ".join(query.strip().split())
+    # If the query contains near-me phrases, we won't consider that as explicit location
+    if requests_frontend_location(q):
+        # It still might also contain 'in Peshawar', so we try to capture a concrete place
+        pass
+    # Capture text after common prepositions
+    m = re.search(r"\b(?:in|at|from|within|around|near)\s+([A-Za-z][A-Za-z .,'\-]{2,60})", q, flags=re.I)
+    if m:
+        candidate = m.group(1).strip().strip(",.")
+        # Ignore if candidate itself is a near-me phrase
+        if not re.search(r"\b(near\s*me|around\s*me|here)\b", candidate, flags=re.I):
+            return candidate
+    # Also allow simple trailing place with no preposition, e.g., "plumber Peshawar"
+    m2 = re.search(r"\b([A-Za-z][A-Za-z .,'\-]{2,60})$", q, flags=re.I)
+    if m2 and not re.search(r"\b(near\s*me|around\s*me|here)\b", m2.group(1), flags=re.I):
+        tail = m2.group(1).strip().strip(",.")
+        # Heuristic: avoid capturing generic words
+        if len(tail.split()) <= 5 and not re.search(r"\b(plumber|electrician|carpenter|mechanic|doctor|dentist|lawyer|cleaner|painter|roofer|locksmith|hvac|pest|service|services)\b", tail, flags=re.I):
+            return tail
+    return None
 
 # ---------- Core logic ----------
 
@@ -284,7 +313,7 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         msvc = re.search(r"\b(plumber|electrician|carpenter|mechanic|doctor|dentist|lawyer|cleaner|painter|roofer|locksmith|hvac|pest)\b", (query or "").lower())
         if msvc:
             svc = msvc.group(1)
-        mloc = re.search(r"\b(?:in|at|near|around)\s+([A-Za-z0-9 .,\-']{2,60})", (query or ""), flags=re.I)
+        mloc = re.search(r"\b(?:in|at|from|around|near)\s+([A-Za-z0-9 .,\-']{2,60})", (query or ""), flags=re.I)
         loc = mloc.group(1).strip().strip(".,") if mloc else None
         parsed = {
             "ai_data": {
@@ -303,40 +332,44 @@ def process_query(query: str, frontend_location: str = None) -> dict:
     ai_data = parsed.setdefault("ai_data", {})
     ai_data["count"] = int(ai_data.get("count") or provider_count)
 
-    used_frontend = False
+    # -------- Location precedence (explicit > frontend > parsed/none) --------
+    explicit_loc = extract_explicit_location_from_query(query)
+    near_me_flag = requests_frontend_location(query)
 
-    loc_from_ai = ai_data.get("location")
-    if isinstance(loc_from_ai, str) and re.search(r'\b(near|nearby|here|around)\b', loc_from_ai.lower()):
-        wants_frontend = True
-    else:
-        wants_frontend = requests_frontend_location(query)
-
-    if wants_frontend and frontend_location:
-        # User said "near me" and we have frontend location
+    if explicit_loc:
+        # If user explicitly said a place, ALWAYS use it
+        ai_data["location"] = explicit_loc
+        parsed["state"] = "complete" if ai_data.get("service") else "need_service"
+        used_frontend = False
+    elif near_me_flag and frontend_location:
+        # No explicit place; user said near me/around me -> use frontend
         ai_data["location"] = frontend_location
         parsed["state"] = "complete" if ai_data.get("service") else "need_service"
         used_frontend = True
     elif ai_data.get("location"):
-        # Location explicitly given in user input
+        # Use whatever the parser extracted
         parsed["state"] = "complete" if ai_data.get("service") else "need_service"
+        used_frontend = False
     else:
-        # No location info at all
         parsed["state"] = "need_location"
         ai_data["location"] = None
+        used_frontend = False
 
-    with conversation_lock:
-        for msg in reversed(conversation):
-            if msg["role"] == "assistant":
-                try:
-                    past = json.loads(msg["content"])
-                    past_ai = past.get("ai_data", {})
-                    if not ai_data.get("service") and past_ai.get("service"):
-                        ai_data["service"] = past_ai.get("service")
-                    if not ai_data.get("location") and past_ai.get("location") and not used_frontend:
-                        ai_data["location"] = past_ai.get("location")
-                except Exception:
-                    pass
-                break
+    # Backfill from past assistant turn only if still missing and we did NOT use frontend
+    if not ai_data.get("location") and not used_frontend:
+        with conversation_lock:
+            for msg in reversed(conversation):
+                if msg["role"] == "assistant":
+                    try:
+                        past = json.loads(msg["content"])
+                        past_ai = past.get("ai_data", {})
+                        if not ai_data.get("service") and past_ai.get("service"):
+                            ai_data["service"] = past_ai.get("service")
+                        if not ai_data.get("location") and past_ai.get("location"):
+                            ai_data["location"] = past_ai.get("location")
+                    except Exception:
+                        pass
+                    break
 
     parsed["ai_data"] = ai_data
 
@@ -348,9 +381,11 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         provider_prompt = (
             f"Using up-to-date web search results, return ONLY valid JSON with key 'providers' containing exactly {desired} unique real providers.\n"
             f"Service: {service}\nLocation: {location}\n\n"
-            "Important: Only include providers physically located in the specified location. "
-            "Do NOT include providers from Pakistan unless the user explicitly asked for Pakistan.\n\n"
-            "For each provider include keys: name, phone, details, address, location_note (EXACT|GENERAL), confidence (HIGH|MEDIUM|LOW).\n"
+            "Rules:\n"
+            " - Only include providers physically located in or clearly servicing the specified location (city/region/country).\n"
+            " - Do not include providers from other cities/countries.\n"
+            " - Assume common geography (e.g., 'Peshawar' -> Pakistan; 'Mumbai' -> India; 'Texas' -> United States).\n\n"
+            "Each provider object must have keys: name, phone, details, address, location_note (EXACT|GENERAL), confidence (HIGH|MEDIUM|LOW).\n"
             "Requirements:\n"
             " - Use ONLY information directly verifiable on live web pages (the web search tool will be used).\n"
             " - If a field is unavailable, set it to an empty string.\n"
