@@ -45,6 +45,78 @@ _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message
 if not logger.handlers:
     logger.addHandler(_h)
 
+# ---------- Phone & location helpers (added) ----------
+
+_COUNTRY_HINTS = {
+    # Pakistan + major cities/regions
+    "pakistan": "+92", "peshawar": "+92", "khyber pakhtunkhwa": "+92",
+    "karachi": "+92", "lahore": "+92", "islamabad": "+92", "rawalpindi": "+92",
+    # A few common others (best-effort; safe fallbacks)
+    "india": "+91", "delhi": "+91", "mumbai": "+91",
+    "united arab emirates": "+971", "uae": "+971", "dubai": "+971", "abu dhabi": "+971",
+    "united states": "+1", "usa": "+1", "new york": "+1", "los angeles": "+1",
+    "united kingdom": "+44", "uk": "+44", "london": "+44",
+}
+
+def _infer_country_code(location_hint: str) -> str | None:
+    if not location_hint:
+        return None
+    s = location_hint.lower()
+    for k, cc in _COUNTRY_HINTS.items():
+        if k in s:
+            return cc
+    return None
+
+def _normalize_phone_e164(raw: str, location_hint: str = "") -> str:
+    """Best-effort E.164 formatting using simple rules + location hint."""
+    if not raw:
+        return ""
+    s = raw.strip()
+    # Keep only + and digits first
+    kept = re.sub(r"[^\d+]", "", s)
+
+    # Already in +CC... form
+    if kept.startswith("+"):
+        return "+" + re.sub(r"[^\d]", "", kept)
+
+    # Handle 00CC...
+    if kept.startswith("00"):
+        return "+" + re.sub(r"[^\d]", "", kept[2:])
+
+    # From here we have digits without a '+'
+    digits = re.sub(r"\D", "", kept)
+    if not digits:
+        return ""
+
+    cc = _infer_country_code(location_hint)
+
+    # If we can guess CC, convert local formats like 03xx... to +92 3xx...
+    if cc:
+        # If number already begins with the country code (e.g., 92...), add '+'
+        if cc == "+92" and digits.startswith("92"):
+            return "+" + digits
+        if cc == "+91" and digits.startswith("91"):
+            return "+" + digits
+        if cc == "+971" and digits.startswith("971"):
+            return "+" + digits
+        if cc == "+44" and digits.startswith("44"):
+            return "+" + digits
+        if cc == "+1" and digits.startswith("1") and len(digits) in (10, 11):
+            # 1xxxxxxxxxx (11) -> +1xxxxxxxxxx, or xxxxxxxxxx (10) -> +1xxxxxxxxxx
+            if len(digits) == 11:
+                return "+" + digits
+            return "+1" + digits
+
+        # Common local style starting with 0 (e.g., Pakistan mobile 03xx...)
+        if digits.startswith("0"):
+            digits = digits.lstrip("0")
+
+        return cc + digits  # e.g., +92 + 3339136477 -> +923339136477
+
+    # Fallback: no location hint — at least prefix '+' so it's "international-like"
+    return "+" + digits
+
+# ---------- Core logic ----------
 
 def detect_provider_count(query: str) -> int:
     q = (query or "").lower()
@@ -95,25 +167,29 @@ def requests_frontend_location(query: str) -> bool:
     return False
 
 
-def normalize_provider(p: dict) -> dict:
+def normalize_provider(p: dict, default_service: str = "", location_hint: str = "") -> dict:
+    """Normalize provider to required schema + add 'service' and format phone to E.164."""
+    phone_norm = _normalize_phone_e164(str(p.get("phone", "")).strip(), location_hint)
     return {
         "name": str(p.get("name", "")).strip(),
-        "phone": str(p.get("phone", "")).strip(),
+        "phone": phone_norm,
         "details": str(p.get("details", "")).strip(),
         "address": str(p.get("address", "")).strip(),
         "location_note": str(p.get("location_note", "GENERAL")).strip(),
         "confidence": str(p.get("confidence", "LOW")).strip(),
+        "service": str(p.get("service", default_service) or "").strip(),
     }
 
 
-def enforce_exact_count(providers: list, desired: int) -> list:
+def enforce_exact_count(providers: list, desired: int, default_service: str = "", location_hint: str = "") -> list:
+    """Ensure we have exactly `desired` providers; preserve schema and add placeholders if needed."""
     if not isinstance(providers, list):
         providers = []
     normalized = []
     for p in providers:
         if not isinstance(p, dict):
             continue
-        entry = normalize_provider(p)
+        entry = normalize_provider(p, default_service=default_service, location_hint=location_hint)
         normalized.append(entry)
     if len(normalized) >= desired:
         return normalized[:desired]
@@ -126,6 +202,7 @@ def enforce_exact_count(providers: list, desired: int) -> list:
             "address": "",
             "location_note": "GENERAL",
             "confidence": "LOW",
+            "service": default_service,
         })
     return padded
 
@@ -326,21 +403,21 @@ def process_query(query: str, frontend_location: str = None) -> dict:
                 pass
             return result
 
-        # Check for source BEFORE normalization (normalizer drops unknown keys)
+        # Check for 'source' on raw providers (normalizer drops unknown keys)
         raw_providers = new_data.get("providers", [])
         missing_source = any(not (isinstance(p, dict) and p.get("source")) for p in raw_providers)
 
-        # Normalize to the mandated schema for output
-        providers = [normalize_provider(p) for p in raw_providers]
+        # Normalize to output schema; add service + E.164 phone
+        providers = [normalize_provider(p, default_service=service, location_hint=location) for p in raw_providers]
 
         if missing_source:
-            # Instead of failing, return providers anyway and just log a warning
+            # Return providers anyway; log a warning & keep suggestions
             result = {
                 "valid": True,
                 "message": f"Here are {len(providers)} providers we found in {location}. Please verify details independently.",
                 "state": "complete",
                 "providers": providers,
-                "suggestions": [service, "repair"],  # always give 1–2 words
+                "suggestions": [service, "repair"],
                 "ai_data": ai_data,
                 "usage_report": {
                     "warning": "missing_sources_in_providers",
@@ -355,7 +432,7 @@ def process_query(query: str, frontend_location: str = None) -> dict:
                 pass
             return result
 
-        parsed_providers = enforce_exact_count(providers, desired)
+        parsed_providers = enforce_exact_count(providers, desired, default_service=service, location_hint=location)
         parsed["providers"] = parsed_providers
         parsed["state"] = "complete"
     else:
