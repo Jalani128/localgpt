@@ -22,7 +22,7 @@ if not logger.handlers:
 
 class QueryRequest(BaseModel):
     query: str
-    city: Optional[str] = None
+    location: Optional[str] = None
 
 
 app = FastAPI(title="localgpt2-server", version="0.2")
@@ -73,7 +73,7 @@ async def post_query(req: QueryRequest):
 
     try:
         logger.info(f"Processing query (endpoint): {req.query}")
-        frontend_location = req.city if req.city else None  # 👈 map city to frontend_location
+        frontend_location = req.location if req.location else None  # 👈 map city to frontend_location
         if frontend_location:
             logger.info(f"User city (frontend_location): {frontend_location}")
 
@@ -81,7 +81,7 @@ async def post_query(req: QueryRequest):
             # Pass query + frontend_location to process_query
             result = await asyncio.wait_for(
                 asyncio.to_thread(process_query, req.query, frontend_location),
-                timeout=60.0
+                timeout=30.0
             )
         except asyncio.TimeoutError:
             logger.error("process_query timed out")
