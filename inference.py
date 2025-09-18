@@ -28,7 +28,7 @@ MANDATORY: Return ONLY valid JSON in this EXACT format (no extra text):
   "valid": true,
   "message": "...",
   "state": "complete|need_service|need_location|redirect|error",
-  "providers": [ { "name":"...","phone":"...","details":"... Please verify contact details independently.","address":"...","location_note":"EXACT|GENERAL|NEARBY","confidence":"HIGH|MEDIUM|LOW" } ],
+  "providers": [ { "name":"...","phone":"...","details":"...","address":"...","location_note":"EXACT|GENERAL|NEARBY","confidence":"HIGH|MEDIUM|LOW","service":"..." } ],
   "suggestions": ["..."],
   "ai_data": {"intent":"...","service":"...","location":"...","confidence":0.9},
   "usage_report": {}
@@ -49,18 +49,43 @@ if not logger.handlers:
 
 _COUNTRY_HINTS = {
     # Pakistan + major cities/regions
-    "pakistan": "+92", "peshawar": "+92", "khyber pakhtunkhwa": "+92",
+    "pakistan": "+92", "peshawar": "+92", "peshaw": "+92", "hayatabad": "+92",
+    "khyber": "+92", "kpk": "+92", "khyber pakhtunkhwa": "+92",
     "karachi": "+92", "lahore": "+92", "islamabad": "+92", "rawalpindi": "+92",
     # India
-    "india": "+91", "mumbai": "+91", "delhi": "+91",
+    "india": "+91", "mumbai": "+91", "delhi": "+91", "bangalore": "+91", "kolkata": "+91", "chennai": "+91",
     # USA
-    "united states": "+1", "usa": "+1", "new york": "+1", "los angeles": "+1", "texas": "+1",
+    "united states": "+1", "usa": "+1", "new york": "+1", "los angeles": "+1", "texas": "+1", "california": "+1",
+    "washington": "+1", "chicago": "+1",
     # UK
-    "united kingdom": "+44", "uk": "+44", "london": "+44",
+    "united kingdom": "+44", "uk": "+44", "london": "+44", "manchester": "+44",
     # UAE
-    "united arab emirates": "+971", "uae": "+971", "dubai": "+971", "abu dhabi": "+971",
+    "united arab emirates": "+971", "uae": "+971", "dubai": "+971", "abu dhabi": "+971", "sharjah": "+971",
     # Morocco
-    "morocco": "+212", "casablanca": "+212",
+    "morocco": "+212", "casablanca": "+212", "rabat": "+212",
+    # Saudi Arabia
+    "saudi arabia": "+966", "ksa": "+966", "riyadh": "+966", "jeddah": "+966",
+}
+
+_COUNTRY_NAME_BY_KEY = {
+    # Pakistan
+    "pakistan": "Pakistan", "peshawar": "Pakistan", "peshaw": "Pakistan", "hayatabad": "Pakistan",
+    "khyber": "Pakistan", "kpk": "Pakistan", "khyber pakhtunkhwa": "Pakistan",
+    "karachi": "Pakistan", "lahore": "Pakistan", "islamabad": "Pakistan", "rawalpindi": "Pakistan",
+    # India
+    "india": "India", "mumbai": "India", "delhi": "India", "bangalore": "India", "kolkata": "India", "chennai": "India",
+    # USA
+    "united states": "United States", "usa": "United States", "new york": "United States", "los angeles": "United States",
+    "texas": "United States", "california": "United States", "washington": "United States", "chicago": "United States",
+    # UK
+    "united kingdom": "United Kingdom", "uk": "United Kingdom", "london": "United Kingdom", "manchester": "United Kingdom",
+    # UAE
+    "united arab emirates": "United Arab Emirates", "uae": "United Arab Emirates",
+    "dubai": "United Arab Emirates", "abu dhabi": "United Arab Emirates", "sharjah": "United Arab Emirates",
+    # Morocco
+    "morocco": "Morocco", "casablanca": "Morocco", "rabat": "Morocco",
+    # Saudi Arabia
+    "saudi arabia": "Saudi Arabia", "ksa": "Saudi Arabia", "riyadh": "Saudi Arabia", "jeddah": "Saudi Arabia",
 }
 
 def _infer_country_code(location_hint: str) -> str | None:
@@ -70,6 +95,24 @@ def _infer_country_code(location_hint: str) -> str | None:
     for k, cc in _COUNTRY_HINTS.items():
         if k in s:
             return cc
+    # extra fuzzy guards
+    if "peshaw" in s or "khyber" in s or "kpk" in s:
+        return "+92"
+    if "mumba" in s or "delh" in s:
+        return "+91"
+    return None
+
+def _infer_country_name(location_hint: str) -> str | None:
+    if not location_hint:
+        return None
+    s = location_hint.lower()
+    for k, name in _COUNTRY_NAME_BY_KEY.items():
+        if k in s:
+            return name
+    if "peshaw" in s or "khyber" in s or "kpk" in s:
+        return "Pakistan"
+    if "mumba" in s or "delh" in s:
+        return "India"
     return None
 
 def _normalize_phone_e164(raw: str, location_hint: str = "") -> str:
@@ -77,7 +120,6 @@ def _normalize_phone_e164(raw: str, location_hint: str = "") -> str:
     if not raw:
         return ""
     s = raw.strip()
-    # Keep only + and digits first
     kept = re.sub(r"[^\d+]", "", s)
 
     # Already +CC...
@@ -95,73 +137,74 @@ def _normalize_phone_e164(raw: str, location_hint: str = "") -> str:
 
     cc = _infer_country_code(location_hint)
 
-    # Apply simple rules for common cases
     if cc:
-        # If already starts with CC digits, just add '+'
         if (cc == "+92" and digits.startswith("92")) or \
            (cc == "+91" and digits.startswith("91")) or \
            (cc == "+971" and digits.startswith("971")) or \
            (cc == "+44" and digits.startswith("44")):
             return "+" + digits
         if cc == "+1":
-            # 1XXXXXXXXXX (11) or XXXXXXXXXX (10)
             if len(digits) == 11 and digits.startswith("1"):
                 return "+" + digits
             if len(digits) == 10:
                 return "+1" + digits
-        # Common local leading 0
         if digits.startswith("0"):
             digits = digits.lstrip("0")
         return cc + digits
 
-    # Fallback: no hint; prefix '+'
     return "+" + digits
 
 def extract_explicit_location_from_query(query: str) -> str | None:
     """
-    Extracts an explicit user-provided location (city/region/country) from the prompt.
-    We treat 'near me/around me/here' as NOT an explicit location.
+    Extract an explicit user-provided location (city/region/country) from the prompt.
+    'near me/around me/here' is NOT an explicit location.
     """
     if not query:
         return None
     q = " ".join(query.strip().split())
-    # If the query contains near-me phrases, we won't consider that as explicit location
-    if requests_frontend_location(q):
-        # It still might also contain 'in Peshawar', so we try to capture a concrete place
-        pass
-    # Capture text after common prepositions
+
+    # Try "in/at/from/within/around/near <Place>"
     m = re.search(r"\b(?:in|at|from|within|around|near)\s+([A-Za-z][A-Za-z .,'\-]{2,60})", q, flags=re.I)
     if m:
         candidate = m.group(1).strip().strip(",.")
-        # Ignore if candidate itself is a near-me phrase
         if not re.search(r"\b(near\s*me|around\s*me|here)\b", candidate, flags=re.I):
             return candidate
-    # Also allow simple trailing place with no preposition, e.g., "plumber Peshawar"
+
+    # Also allow final token heuristic: "... plumber Peshawar"
     m2 = re.search(r"\b([A-Za-z][A-Za-z .,'\-]{2,60})$", q, flags=re.I)
     if m2 and not re.search(r"\b(near\s*me|around\s*me|here)\b", m2.group(1), flags=re.I):
         tail = m2.group(1).strip().strip(",.")
-        # Heuristic: avoid capturing generic words
-        if len(tail.split()) <= 5 and not re.search(r"\b(plumber|electrician|carpenter|mechanic|doctor|dentist|lawyer|cleaner|painter|roofer|locksmith|hvac|pest|service|services)\b", tail, flags=re.I):
+        if len(tail.split()) <= 5 and not re.search(
+            r"\b(plumber|electrician|carpenter|mechanic|doctor|dentist|lawyer|cleaner|painter|roofer|locksmith|hvac|pest|service|services)\b",
+            tail, flags=re.I):
             return tail
     return None
+
+def extract_explicit_count(query: str) -> int | None:
+    """Return a user-typed number (3..20) if present; otherwise None."""
+    if not query:
+        return None
+    m = re.search(r"\b(\d{1,2})\b", query)
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+        return min(max(n, 3), 20)
+    except Exception:
+        return None
 
 # ---------- Core logic ----------
 
 def detect_provider_count(query: str) -> int:
-    q = (query or "").lower()
-    if "load more" in q or "more providers" in q:
-        return 10
-    if "all" in q or "maximum" in q:
-        return 20
-    m = re.search(r"\b(\d+)\b", q)
+    # Default to 5; only change if the user typed a number.
+    m = re.search(r"\b(\d{1,2})\b", (query or ""))
     if m:
         try:
             n = int(m.group(1))
             return min(max(n, 3), 20)
         except Exception:
-            return 5
+            pass
     return 5
-
 
 def safe_json_parse(text: str) -> dict:
     if not text:
@@ -178,14 +221,12 @@ def safe_json_parse(text: str) -> dict:
                 return {}
     return {}
 
-
 NEAR_ME_PHRASES = [
     "near me", "nearby", "my area", "around here", "around me", "here in the area",
     "here", "near us", "nearby us", "close to me", "close by", "in my area",
     "newar me", "newar", "aroundme", "nearme"
 ]
 _NEAR_ME_PATTERNS = [re.compile(r"\b" + re.escape(p) + r"\b", flags=re.I) for p in NEAR_ME_PHRASES]
-
 
 def requests_frontend_location(query: str) -> bool:
     if not query:
@@ -194,7 +235,6 @@ def requests_frontend_location(query: str) -> bool:
         if pat.search(query):
             return True
     return False
-
 
 def normalize_provider(p: dict, default_service: str = "", location_hint: str = "") -> dict:
     """Normalize provider to required schema + add 'service' and format phone to E.164."""
@@ -208,7 +248,6 @@ def normalize_provider(p: dict, default_service: str = "", location_hint: str = 
         "confidence": str(p.get("confidence", "LOW")).strip(),
         "service": str(p.get("service", default_service) or "").strip(),
     }
-
 
 def enforce_exact_count(providers: list, desired: int, default_service: str = "", location_hint: str = "") -> list:
     """Ensure we have exactly `desired` providers; preserve schema and add placeholders if needed."""
@@ -227,14 +266,13 @@ def enforce_exact_count(providers: list, desired: int, default_service: str = ""
         padded.append({
             "name": f"Provider {i+1} (incomplete)",
             "phone": "",
-            "details": "This entry was added because web results were insufficient. Please verify contact details independently.",
+            "details": "Added because web results were limited.",
             "address": "",
             "location_note": "GENERAL",
             "confidence": "LOW",
             "service": default_service,
         })
     return padded
-
 
 def try_web_response(prompt_text: str, model: str = "gpt-4o", max_output_tokens: int = 800, temperature: float = 0.0):
     attempts = []
@@ -264,7 +302,6 @@ def try_web_response(prompt_text: str, model: str = "gpt-4o", max_output_tokens:
     logger.warning("try_web_response: all attempts failed: %s", attempts)
     return None, None, None
 
-
 def process_query(query: str, frontend_location: str = None) -> dict:
     global conversation
     logger.info("process_query received query: %s", query)
@@ -289,7 +326,7 @@ def process_query(query: str, frontend_location: str = None) -> dict:
     if not parse_resp_obj or not parse_raw:
         result = {
             "valid": False,
-            "message": "Web search tool unavailable or parse step failed — cannot return real web-sourced providers.",
+            "message": "I can help. What service and city are you looking for?",
             "state": "error",
             "providers": [],
             "suggestions": [],
@@ -313,83 +350,85 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         msvc = re.search(r"\b(plumber|electrician|carpenter|mechanic|doctor|dentist|lawyer|cleaner|painter|roofer|locksmith|hvac|pest)\b", (query or "").lower())
         if msvc:
             svc = msvc.group(1)
-        mloc = re.search(r"\b(?:in|at|from|around|near)\s+([A-Za-z0-9 .,\-']{2,60})", (query or ""), flags=re.I)
-        loc = mloc.group(1).strip().strip(".,") if mloc else None
+        # We do not trust parser for location; explicit or frontend only
         parsed = {
             "ai_data": {
                 "intent": "find_service" if svc else None,
                 "service": svc,
-                "location": loc,
+                "location": None,
                 "confidence": 0.6 if svc else 0.0,
                 "count": provider_count
             },
-            "state": "complete" if svc and loc else ("need_service" if not svc else "need_location"),
+            "state": "need_location" if svc else "need_service",
             "message": "",
             "suggestions": ["plumber", "electrician"] if not svc else [],
             "providers": []
         }
 
     ai_data = parsed.setdefault("ai_data", {})
-    ai_data["count"] = int(ai_data.get("count") or provider_count)
 
-    # -------- Location precedence (explicit > frontend > parsed/none) --------
+    # ----- FORCE count to 5 unless user explicitly typed a number -----
+    explicit_count = extract_explicit_count(query)
+    if explicit_count is not None:
+        ai_data["count"] = explicit_count
+    else:
+        ai_data["count"] = 5
+
+    # -------- Location precedence (explicit > frontend > need_location) --------
     explicit_loc = extract_explicit_location_from_query(query)
     near_me_flag = requests_frontend_location(query)
 
+    used_frontend = False
     if explicit_loc:
-        # If user explicitly said a place, ALWAYS use it
         ai_data["location"] = explicit_loc
         parsed["state"] = "complete" if ai_data.get("service") else "need_service"
-        used_frontend = False
     elif near_me_flag and frontend_location:
-        # No explicit place; user said near me/around me -> use frontend
         ai_data["location"] = frontend_location
         parsed["state"] = "complete" if ai_data.get("service") else "need_service"
         used_frontend = True
-    elif ai_data.get("location"):
-        # Use whatever the parser extracted
-        parsed["state"] = "complete" if ai_data.get("service") else "need_service"
-        used_frontend = False
     else:
-        parsed["state"] = "need_location"
-        ai_data["location"] = None
-        used_frontend = False
+        # Ask for location if none provided
+        if not ai_data.get("location"):
+            ai_data["location"] = None
+            parsed["state"] = "need_location"
 
-    # Backfill from past assistant turn only if still missing and we did NOT use frontend
-    if not ai_data.get("location") and not used_frontend:
-        with conversation_lock:
-            for msg in reversed(conversation):
-                if msg["role"] == "assistant":
-                    try:
-                        past = json.loads(msg["content"])
-                        past_ai = past.get("ai_data", {})
-                        if not ai_data.get("service") and past_ai.get("service"):
-                            ai_data["service"] = past_ai.get("service")
-                        if not ai_data.get("location") and past_ai.get("location"):
-                            ai_data["location"] = past_ai.get("location")
-                    except Exception:
-                        pass
-                    break
+    # Backfill ONLY service from last assistant turn (NEVER location)
+    with conversation_lock:
+        for msg in reversed(conversation):
+            if msg["role"] == "assistant":
+                try:
+                    past = json.loads(msg["content"])
+                    past_ai = past.get("ai_data", {})
+                    if not ai_data.get("service") and past_ai.get("service"):
+                        ai_data["service"] = past_ai.get("service")
+                except Exception:
+                    pass
+                break
 
     parsed["ai_data"] = ai_data
 
     if parsed.get("state") == "complete":
         service = ai_data.get("service")
         location = ai_data.get("location")
-        desired = int(ai_data.get("count") or provider_count)
+        desired = int(ai_data.get("count") or 5)
+        country_name = _infer_country_name(location) or "Unknown"
+        cc_hint = _infer_country_code(location) or ""
 
         provider_prompt = (
-            f"Using up-to-date web search results, return ONLY valid JSON with key 'providers' containing exactly {desired} unique real providers.\n"
-            f"Service: {service}\nLocation: {location}\n\n"
-            "Rules:\n"
-            " - Only include providers physically located in or clearly servicing the specified location (city/region/country).\n"
-            " - Do not include providers from other cities/countries.\n"
-            " - Assume common geography (e.g., 'Peshawar' -> Pakistan; 'Mumbai' -> India; 'Texas' -> United States).\n\n"
+            f"Using up-to-date web search, return ONLY valid JSON with key 'providers' containing exactly {desired} unique real providers.\n"
+            f"Service: {service}\n"
+            f"Location: {location}\n"
+            f"Inferred country: {country_name}\n\n"
+            "Geography guardrails:\n"
+            " - Results must be from the specified location/country. Do NOT include results from other countries.\n"
+            " - If the country is Unknown, infer correctly from the city/region (e.g., Peshawar → Pakistan, Mumbai → India) and DO NOT assume United States unless the location is clearly in the US.\n"
+            " - Prefer local sources/TLDs and listings that mention the city/region in the address.\n"
+            " - Prefer phone numbers that match local numbering (e.g., country code patterns).\n\n"
             "Each provider object must have keys: name, phone, details, address, location_note (EXACT|GENERAL), confidence (HIGH|MEDIUM|LOW).\n"
-            "Requirements:\n"
-            " - Use ONLY information directly verifiable on live web pages (the web search tool will be used).\n"
+            "Rules:\n"
+            " - Use ONLY information visible on live web pages (the web search tool will be used).\n"
             " - If a field is unavailable, set it to an empty string.\n"
-            " - Ensure each 'details' ends with 'Please verify contact details independently.'\n\n"
+            " - Do NOT add any verification disclaimers to details.\n\n"
             "Return exactly one top-level JSON object and nothing else."
         )
 
@@ -398,10 +437,10 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         if not prov_resp_obj or not prov_raw:
             result = {
                 "valid": False,
-                "message": "Provider generation failed or web search tool unavailable — cannot return real providers.",
+                "message": f"I couldn’t fetch providers for {service} in {location} right now.",
                 "state": "error",
                 "providers": [],
-                "suggestions": [],
+                "suggestions": [service or "service", (location or "nearby").split()[0]],
                 "ai_data": ai_data,
                 "usage_report": {
                     "error": "provider_generation_failed_or_no_web_tool",
@@ -420,10 +459,10 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         if not isinstance(new_data, dict) or not isinstance(new_data.get("providers"), list):
             result = {
                 "valid": False,
-                "message": "Provider generation returned unparsable or missing 'providers' — aborting to avoid fabricated data.",
+                "message": "I had trouble reading provider data. Mind trying again with the city name?",
                 "state": "error",
                 "providers": [],
-                "suggestions": [],
+                "suggestions": [service or "service", (location or "nearby").split()[0]],
                 "ai_data": ai_data,
                 "usage_report": {
                     "error": "provider_generation_unparseable",
@@ -449,10 +488,10 @@ def process_query(query: str, frontend_location: str = None) -> dict:
             # Return providers anyway; log a warning & keep suggestions
             result = {
                 "valid": True,
-                "message": f"Here are {len(providers)} providers we found in {location}. Please verify details independently.",
+                "message": f"Here are {len(providers)} {service}s in {location}.",
                 "state": "complete",
                 "providers": providers,
-                "suggestions": [service, "repair"],
+                "suggestions": [service or "service", (location or "nearby").split()[0]],
                 "ai_data": ai_data,
                 "usage_report": {
                     "warning": "missing_sources_in_providers",
@@ -478,12 +517,21 @@ def process_query(query: str, frontend_location: str = None) -> dict:
     ai_data = parsed.get("ai_data", {"intent": None, "service": None, "location": None, "confidence": 0.0})
 
     suggestions = parsed.get("suggestions", [])
-    if not suggestions and ai_data.get("service"):
-        suggestions = [ai_data["service"], "repair"]  # fallback keywords
+    if not suggestions:
+        if ai_data.get("service") and ai_data.get("location"):
+            suggestions = [ai_data["service"], ai_data["location"].split()[0]]
+        elif ai_data.get("service"):
+            suggestions = [ai_data["service"], "nearby"]
 
     if isinstance(parsed, dict):
-        default_msg = f"Here are {ai_data.get('count')} {ai_data.get('service','')} providers in {ai_data.get('location','your area')}."
-        message = parsed.get("message", default_msg)
+        if parsed.get("state") == "need_location":
+            message = "Got it—what city should I look in?"
+        elif parsed.get("state") == "need_service":
+            message = "Sure—what kind of service do you need and where?"
+        elif parsed.get("state") == "complete":
+            message = f"Here are {ai_data.get('count')} {ai_data.get('service','')} providers in {ai_data.get('location','your area')}."
+        else:
+            message = "I’m ready—tell me the service and city."
     else:
         message = ""
 
@@ -496,7 +544,7 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         "ai_data": ai_data,
         "usage_report": {
             "parse_tool_used": parse_resp_obj and getattr(parse_resp_obj, "model", None),
-            "provider_tool_used": prov_resp_obj and getattr(prov_resp_obj, "model", None),
+            "provider_tool_used": prov_resp_obj and getattr(prov_resp_obj, "model", None) if 'prov_resp_obj' in locals() else None,
             "timestamp": datetime.now().isoformat()
         }
     }
@@ -508,7 +556,6 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         pass
 
     return result
-
 
 if __name__ == "__main__":
     while True:
