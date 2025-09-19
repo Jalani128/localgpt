@@ -375,22 +375,40 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         ai_data["count"] = 5
 
     # -------- Location precedence (explicit > frontend > need_location) --------
-    explicit_loc = extract_explicit_location_from_query(query)
-    near_me_flag = requests_frontend_location(query)
+    # explicit_loc = extract_explicit_location_from_query(query)
+    # near_me_flag = requests_frontend_location(query)
 
-    used_frontend = False
-    if explicit_loc:
-        ai_data["location"] = explicit_loc
-        parsed["state"] = "complete" if ai_data.get("service") else "need_service"
-    elif near_me_flag and frontend_location:
-        ai_data["location"] = frontend_location
-        parsed["state"] = "complete" if ai_data.get("service") else "need_service"
-        used_frontend = True
-    else:
-        # Ask for location if none provided
-        if not ai_data.get("location"):
-            ai_data["location"] = None
-            parsed["state"] = "need_location"
+    # used_frontend = False
+    # if explicit_loc:
+    #     ai_data["location"] = explicit_loc
+    #     parsed["state"] = "complete" if ai_data.get("service") else "need_service"
+    # elif near_me_flag and frontend_location:
+    #     ai_data["location"] = frontend_location
+    #     parsed["state"] = "complete" if ai_data.get("service") else "need_service"
+    #     used_frontend = True
+    # else:
+    #     # Ask for location if none provided
+    #     if not ai_data.get("location"):
+    #         ai_data["location"] = None
+    #         parsed["state"] = "need_location"
+    explicit_loc = extract_explicit_location_from_query(query)
+near_me_flag = requests_frontend_location(query)
+
+if explicit_loc:
+    ai_data["location"] = explicit_loc
+    parsed["state"] = "complete" if ai_data.get("service") else "need_service"
+elif frontend_location:  
+    # always override with latest frontend_location if passed
+    ai_data["location"] = frontend_location
+    parsed["state"] = "complete" if ai_data.get("service") else "need_service"
+elif near_me_flag:
+    # fallback if user said "near me" but frontend_location not provided
+    ai_data["location"] = None
+    parsed["state"] = "need_location"
+else:
+    if not ai_data.get("location"):
+        ai_data["location"] = None
+        parsed["state"] = "need_location"
 
     # Backfill ONLY service from last assistant turn (NEVER location)
     with conversation_lock:
