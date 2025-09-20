@@ -1,4 +1,4 @@
-# inference.py  -- Mature, robust brain. Responses API + web_search enforced (fallbacks intact)
+# inference.py  -- Responses API + web_search enforced (fail if web unavailable)
 from openai import OpenAI
 import json
 import threading
@@ -6,11 +6,11 @@ import re
 from datetime import datetime
 from config import OPENAI_API_KEY
 import logging
+import traceback
 from difflib import get_close_matches
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---- System prompt (unchanged contract) ----
 conversation = [
     {
         "role": "system",
@@ -41,9 +41,9 @@ conversation_lock = threading.Lock()
 
 logger = logging.getLogger("localgpt2.inference")
 logger.setLevel(logging.INFO)
+_h = logging.StreamHandler()
+_h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
 if not logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logger.addHandler(_h)
 
 # ---------- Phone & location helpers ----------
@@ -69,16 +69,23 @@ _COUNTRY_HINTS = {
 }
 
 _COUNTRY_NAME_BY_KEY = {
+    # Pakistan
     "pakistan": "Pakistan", "peshawar": "Pakistan", "peshaw": "Pakistan", "hayatabad": "Pakistan",
     "khyber": "Pakistan", "kpk": "Pakistan", "khyber pakhtunkhwa": "Pakistan",
     "karachi": "Pakistan", "lahore": "Pakistan", "islamabad": "Pakistan", "rawalpindi": "Pakistan",
+    # India
     "india": "India", "mumbai": "India", "delhi": "India", "bangalore": "India", "kolkata": "India", "chennai": "India",
+    # USA
     "united states": "United States", "usa": "United States", "new york": "United States", "los angeles": "United States",
     "texas": "United States", "california": "United States", "washington": "United States", "chicago": "United States",
+    # UK
     "united kingdom": "United Kingdom", "uk": "United Kingdom", "london": "United Kingdom", "manchester": "United Kingdom",
+    # UAE
     "united arab emirates": "United Arab Emirates", "uae": "United Arab Emirates",
     "dubai": "United Arab Emirates", "abu dhabi": "United Arab Emirates", "sharjah": "United Arab Emirates",
+    # Morocco
     "morocco": "Morocco", "casablanca": "Morocco", "rabat": "Morocco",
+    # Saudi Arabia
     "saudi arabia": "Saudi Arabia", "ksa": "Saudi Arabia", "riyadh": "Saudi Arabia", "jeddah": "Saudi Arabia",
 }
 
@@ -89,6 +96,7 @@ def _infer_country_code(location_hint: str) -> str | None:
     for k, cc in _COUNTRY_HINTS.items():
         if k in s:
             return cc
+    # extra fuzzy guards
     if "peshaw" in s or "khyber" in s or "kpk" in s:
         return "+92"
     if "mumba" in s or "delh" in s:
@@ -109,17 +117,27 @@ def _infer_country_name(location_hint: str) -> str | None:
     return None
 
 def _normalize_phone_e164(raw: str, location_hint: str = "") -> str:
+    """Best-effort E.164 formatting using simple rules + location hint."""
     if not raw:
         return ""
-    kept = re.sub(r"[^\d+]", "", raw.strip())
+    s = raw.strip()
+    kept = re.sub(r"[^\d+]", "", s)
+
+    # Already +CC...
     if kept.startswith("+"):
         return "+" + re.sub(r"[^\d]", "", kept)
+
+    # 00CC...
     if kept.startswith("00"):
         return "+" + re.sub(r"[^\d]", "", kept[2:])
+
+    # Bare digits
     digits = re.sub(r"\D", "", kept)
     if not digits:
         return ""
+
     cc = _infer_country_code(location_hint)
+
     if cc:
         if (cc == "+92" and digits.startswith("92")) or \
            (cc == "+91" and digits.startswith("91")) or \
@@ -134,17 +152,23 @@ def _normalize_phone_e164(raw: str, location_hint: str = "") -> str:
         if digits.startswith("0"):
             digits = digits.lstrip("0")
         return cc + digits
+
     return "+" + digits
 
 def extract_explicit_location_from_query(query: str) -> str | None:
+    """Extract an explicit user-provided location (city/region/country) from the prompt."""
     if not query:
         return None
     q = " ".join(query.strip().split())
+
+    # Try "in/at/from/within/around/near <Place>"
     m = re.search(r"\b(?:in|at|from|within|around|near)\s+([A-Za-z][A-Za-z .,'\-]{2,60})", q, flags=re.I)
     if m:
-        cand = m.group(1).strip().strip(",.")
-        if not re.search(r"\b(near\s*me|around\s*me|here)\b", cand, flags=re.I):
-            return cand
+        candidate = m.group(1).strip().strip(",.")
+        if not re.search(r"\b(near\s*me|around\s*me|here)\b", candidate, flags=re.I):
+            return candidate
+
+    # Also allow final token heuristic: "... plumber Peshawar"
     m2 = re.search(r"\b([A-Za-z][A-Za-z .,'\-]{2,60})$", q, flags=re.I)
     if m2 and not re.search(r"\b(near\s*me|around\s*me|here)\b", m2.group(1), flags=re.I):
         tail = m2.group(1).strip().strip(",.")
@@ -155,6 +179,7 @@ def extract_explicit_location_from_query(query: str) -> str | None:
     return None
 
 def extract_explicit_count(query: str) -> int | None:
+    """Return a user-typed number (3..20) if present; otherwise None."""
     if not query:
         return None
     m = re.search(r"\b(\d{1,2})\b", query)
@@ -166,13 +191,15 @@ def extract_explicit_count(query: str) -> int | None:
     except Exception:
         return None
 
-# ---------- Service normalization & fuzzy detection ----------
+# ---------- NEW: Service normalization & fuzzy detection ----------
 
+# Canonical service names you support (extend as needed)
 _SERVICE_CANON = [
     "plumber", "electrician", "carpenter", "mechanic", "doctor", "dentist",
     "lawyer", "cleaner", "painter", "roofer", "locksmith", "hvac", "pest"
 ]
 
+# Common typos / variants
 _SERVICE_VARIANTS = {
     "plumber": {"plubmer", "plumbr", "plmber", "plummers", "plumbing"},
     "electrician": {"electrican", "electritian", "electrictian", "electician", "electicent", "electicentt", "electric", "electrcian"},
@@ -189,7 +216,10 @@ _SERVICE_VARIANTS = {
     "roofer": {"roofing"},
 }
 
-_VARIANT_TO_CANON = {v: k for k, vs in _SERVICE_VARIANTS.items() for v in vs}
+_VARIANT_TO_CANON = {}
+for canon, vars_ in _SERVICE_VARIANTS.items():
+    for v in vars_:
+        _VARIANT_TO_CANON[v] = canon
 
 def _canonical_service_from_token(tok: str) -> str | None:
     t = tok.lower().strip()
@@ -197,6 +227,7 @@ def _canonical_service_from_token(tok: str) -> str | None:
         return t
     if t in _VARIANT_TO_CANON:
         return _VARIANT_TO_CANON[t]
+    # fuzzy close match on canonical names + variant keys
     candidates = _SERVICE_CANON + list(_VARIANT_TO_CANON.keys())
     hits = get_close_matches(t, candidates, n=1, cutoff=0.79)
     if hits:
@@ -207,9 +238,11 @@ def _canonical_service_from_token(tok: str) -> str | None:
 def detect_service_from_text(query: str) -> str | None:
     if not query:
         return None
+    # direct regex scan
     m = re.search(r"\b(plumber|electrician|carpenter|mechanic|doctor|dentist|lawyer|cleaner|painter|roofer|locksmith|hvac|pest)\b", query, flags=re.I)
     if m:
         return m.group(1).lower()
+    # token-wise fuzzy
     tokens = re.findall(r"[A-Za-z][A-Za-z\-]+", query)
     for tok in tokens:
         canon = _canonical_service_from_token(tok)
@@ -217,9 +250,10 @@ def detect_service_from_text(query: str) -> str | None:
             return canon
     return None
 
-# ---------- Parsing utilities ----------
+# ---------- Core logic ----------
 
 def detect_provider_count(query: str) -> int:
+    # Default to 5; only change if the user typed a number.
     m = re.search(r"\b(\d{1,2})\b", (query or ""))
     if m:
         try:
@@ -254,9 +288,13 @@ _NEAR_ME_PATTERNS = [re.compile(r"\b" + re.escape(p) + r"\b", flags=re.I) for p 
 def requests_frontend_location(query: str) -> bool:
     if not query:
         return False
-    return any(p.search(query) for p in _NEAR_ME_PATTERNS)
+    for pat in _NEAR_ME_PATTERNS:
+        if pat.search(query):
+            return True
+    return False
 
 def normalize_provider(p: dict, default_service: str = "", location_hint: str = "") -> dict:
+    """Normalize provider to required schema + add 'service' and format phone to E.164."""
     phone_norm = _normalize_phone_e164(str(p.get("phone", "")).strip(), location_hint)
     return {
         "name": str(p.get("name", "")).strip(),
@@ -269,18 +307,14 @@ def normalize_provider(p: dict, default_service: str = "", location_hint: str = 
     }
 
 def enforce_exact_count(providers: list, desired: int, default_service: str = "", location_hint: str = "") -> list:
+    """Ensure we have exactly `desired` providers; preserve schema and add placeholders if needed."""
     if not isinstance(providers, list):
         providers = []
     normalized = []
-    seen = set()
     for p in providers:
         if not isinstance(p, dict):
             continue
         entry = normalize_provider(p, default_service=default_service, location_hint=location_hint)
-        key = (entry["name"].lower(), entry["phone"])
-        if key in seen:
-            continue
-        seen.add(key)
         normalized.append(entry)
     if len(normalized) >= desired:
         return normalized[:desired]
@@ -325,20 +359,16 @@ def try_web_response(prompt_text: str, model: str = "gpt-4o", max_output_tokens:
     logger.warning("try_web_response: all attempts failed: %s", attempts)
     return None, None, None
 
-# ---------- Core ----------
-
 def process_query(query: str, frontend_location: str = None) -> dict:
     global conversation
     logger.info("process_query received query: %s", query)
     provider_count = detect_provider_count(query)
 
-    # keep the convo small and fresh
     with conversation_lock:
         if len(conversation) > 7:
             conversation = [conversation[0]] + conversation[-6:]
         conversation.append({"role": "user", "content": query})
 
-    # Ask the model to parse — we still harden with local fallbacks
     parse_prompt = (
         "Use live web search results to extract and return ONLY valid JSON with keys: "
         "ai_data, state, message, suggestions, providers. "
@@ -346,7 +376,8 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         f"User: {query}\n"
         "Return ONE JSON object only."
     )
-    parse_resp_obj, parse_raw, _ = try_web_response(parse_prompt, model="gpt-4o", max_output_tokens=800, temperature=0.0)
+
+    parse_resp_obj, parse_raw, parse_tool = try_web_response(parse_prompt, model="gpt-4o", max_output_tokens=800, temperature=0.0)
 
     if not parse_resp_obj or not parse_raw:
         result = {
@@ -358,16 +389,20 @@ def process_query(query: str, frontend_location: str = None) -> dict:
             "ai_data": {"intent": None, "service": None, "location": None, "confidence": 0.0},
             "usage_report": {
                 "error": "web_tool_unavailable_or_parse_failed",
+                "attempted_tools": ["web_search", "web_search_preview"],
                 "timestamp": datetime.now().isoformat()
             }
         }
-        with conversation_lock:
-            conversation.append({"role": "assistant", "content": json.dumps(result)})
+        try:
+            with conversation_lock:
+                conversation.append({"role": "assistant", "content": json.dumps(result)})
+        except Exception:
+            pass
         return result
 
     parsed = safe_json_parse(parse_raw)
     if not isinstance(parsed, dict) or not parsed.get("ai_data"):
-        # Local, deterministic fallback
+        # Fallback when parser fails
         svc = detect_service_from_text(query)
         parsed = {
             "ai_data": {
@@ -385,17 +420,17 @@ def process_query(query: str, frontend_location: str = None) -> dict:
 
     ai_data = parsed.setdefault("ai_data", {})
 
-    # Count: explicit or default 5
+    # --- Force COUNT to explicit or default 5
     explicit_count = extract_explicit_count(query)
     ai_data["count"] = explicit_count if explicit_count is not None else 5
 
-    # Service: normalize + fuzzy
+    # --- Strengthen/normalize SERVICE (handles typos like "electicent")
     if ai_data.get("service"):
         ai_data["service"] = _canonical_service_from_token(str(ai_data["service"])) or detect_service_from_text(query)
     if not ai_data.get("service"):
         ai_data["service"] = detect_service_from_text(query)
 
-    # Location precedence: explicit > latest frontend_location > ask
+    # -------- Location precedence (explicit > frontend > memory/ask) --------
     explicit_loc = extract_explicit_location_from_query(query)
     near_me_flag = requests_frontend_location(query)
 
@@ -403,7 +438,8 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         ai_data["location"] = explicit_loc
         parsed["state"] = "complete" if ai_data.get("service") else "need_service"
     elif frontend_location:
-        ai_data["location"] = frontend_location  # always newest
+        # ALWAYS use the latest frontend location if the UI sent one
+        ai_data["location"] = frontend_location
         parsed["state"] = "complete" if ai_data.get("service") else "need_service"
     elif near_me_flag:
         ai_data["location"] = None
@@ -413,7 +449,7 @@ def process_query(query: str, frontend_location: str = None) -> dict:
             ai_data["location"] = None
             parsed["state"] = "need_location"
 
-    # Only backfill SERVICE from last turn (never location)
+    # Backfill ONLY service from the last assistant turn (never location)
     with conversation_lock:
         for msg in reversed(conversation):
             if msg["role"] == "assistant":
@@ -428,7 +464,6 @@ def process_query(query: str, frontend_location: str = None) -> dict:
 
     parsed["ai_data"] = ai_data
 
-    # ----- Provider fetch -----
     if parsed.get("state") == "complete":
         service = ai_data.get("service")
         location = ai_data.get("location")
@@ -441,45 +476,78 @@ def process_query(query: str, frontend_location: str = None) -> dict:
             f"Location: {location}\n"
             f"Inferred country: {country_name}\n\n"
             "Geography guardrails:\n"
-            " - Results must be from the specified location/country.\n"
-            " - If country is Unknown, infer from city/region (e.g., Peshawar→Pakistan, Mumbai→India). Never assume US by default.\n"
-            " - Prefer listings that explicitly mention the target city/region and plausible phone formats.\n\n"
+            " - Results must be from the specified location/country. Do NOT include results from other countries.\n"
+            " - If the country is Unknown, infer correctly from the city/region (e.g., Peshawar → Pakistan, Mumbai → India) and DO NOT assume United States unless the location is clearly in the US.\n"
+            " - Prefer local sources/TLDs and listings that mention the city/region in the address.\n"
+            " - Prefer phone numbers that match local numbering (e.g., country code patterns).\n\n"
             "Each provider object must have keys: name, phone, details, address, location_note (EXACT|GENERAL), confidence (HIGH|MEDIUM|LOW).\n"
-            "If a field is unavailable, set it to an empty string. Return exactly one top-level JSON object."
+            "Rules:\n"
+            " - Use ONLY information visible on live web pages (the web search tool will be used).\n"
+            " - If a field is unavailable, set it to an empty string.\n"
+            " - Do NOT add any verification disclaimers to details.\n\n"
+            "Return exactly one top-level JSON object and nothing else."
         )
 
-        prov_resp_obj, prov_raw, _ = try_web_response(provider_prompt, model="gpt-4o", max_output_tokens=1500, temperature=0.1)
+        prov_resp_obj, prov_raw, prov_tool = try_web_response(provider_prompt, model="gpt-4o", max_output_tokens=1500, temperature=0.1)
+
         if not prov_resp_obj or not prov_raw:
             result = {
                 "valid": False,
                 "message": f"I couldn’t fetch providers for {service} in {location} right now.",
                 "state": "error",
                 "providers": [],
-                "suggestions": [service or "service", (location or 'nearby').split()[0]],
+                "suggestions": [service or "service", (location or "nearby").split()[0]],
                 "ai_data": ai_data,
                 "usage_report": {
                     "error": "provider_generation_failed_or_no_web_tool",
+                    "attempted_tools": ["web_search", "web_search_preview"],
                     "timestamp": datetime.now().isoformat()
                 }
             }
-            with conversation_lock:
-                conversation.append({"role": "assistant", "content": json.dumps(result)})
+            try:
+                with conversation_lock:
+                    conversation.append({"role": "assistant", "content": json.dumps(result)})
+            except Exception:
+                pass
             return result
 
         new_data = safe_json_parse(prov_raw)
-        raw_providers = new_data.get("providers", []) if isinstance(new_data, dict) else []
+        if not isinstance(new_data, dict) or not isinstance(new_data.get("providers"), list):
+            result = {
+                "valid": False,
+                "message": "I had trouble reading provider data. Mind trying again with the city name?",
+                "state": "error",
+                "providers": [],
+                "suggestions": [service or "service", (location or "nearby").split()[0]],
+                "ai_data": ai_data,
+                "usage_report": {
+                    "error": "provider_generation_unparseable",
+                    "raw": prov_raw[:1000],
+                    "timestamp": datetime.now().isoformat()
+                }
+            }
+            try:
+                with conversation_lock:
+                    conversation.append({"role": "assistant", "content": json.dumps(result)})
+            except Exception:
+                pass
+            return result
 
+        raw_providers = new_data.get("providers", [])
+
+        # Normalize to output schema; add service + E.164 phone
         providers = [normalize_provider(p, default_service=service, location_hint=location) for p in raw_providers]
-        parsed_providers = enforce_exact_count(providers, desired, default_service=service, location_hint=location)
 
+        parsed_providers = enforce_exact_count(providers, desired, default_service=service, location_hint=location)
         parsed["providers"] = parsed_providers
         parsed["state"] = "complete"
     else:
         parsed.setdefault("providers", [])
         parsed["state"] = parsed.get("state", "error")
 
-    # ----- Final shaping (stable messages maintained) -----
+    # Build friendly defaults and ensure suggestions are not empty
     ai_data = parsed.get("ai_data", {"intent": None, "service": None, "location": None, "confidence": 0.0})
+
     suggestions = parsed.get("suggestions", [])
     if not suggestions:
         if ai_data.get("service") and ai_data.get("location"):
@@ -487,14 +555,17 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         elif ai_data.get("service"):
             suggestions = [ai_data["service"], "nearby"]
 
-    if parsed.get("state") == "need_location":
-        message = "Got it—what city should I look in?"
-    elif parsed.get("state") == "need_service":
-        message = "Sure—what kind of service do you need and where?"
-    elif parsed.get("state") == "complete":
-        message = f"Here are {ai_data.get('count')} {ai_data.get('service','')} providers in {ai_data.get('location','your area')}."
+    if isinstance(parsed, dict):
+        if parsed.get("state") == "need_location":
+            message = "Got it—what city should I look in?"
+        elif parsed.get("state") == "need_service":
+            message = "Sure—what kind of service do you need and where?"
+        elif parsed.get("state") == "complete":
+            message = f"Here are {ai_data.get('count')} {ai_data.get('service','')} providers in {ai_data.get('location','your area')}."
+        else:
+            message = "I’m ready—tell me the service and city."
     else:
-        message = "I’m ready—tell me the service and city."
+        message = ""
 
     result = {
         "valid": True,
@@ -504,12 +575,17 @@ def process_query(query: str, frontend_location: str = None) -> dict:
         "suggestions": suggestions,
         "ai_data": ai_data,
         "usage_report": {
+            "parse_tool_used": parse_resp_obj and getattr(parse_resp_obj, "model", None),
+            "provider_tool_used": prov_resp_obj and getattr(prov_resp_obj, "model", None) if 'prov_resp_obj' in locals() else None,
             "timestamp": datetime.now().isoformat()
         }
     }
 
-    with conversation_lock:
-        conversation.append({"role": "assistant", "content": json.dumps(result)})
+    try:
+        with conversation_lock:
+            conversation.append({"role": "assistant", "content": json.dumps(result)})
+    except Exception:
+        pass
 
     return result
 
@@ -518,5 +594,6 @@ if __name__ == "__main__":
         query = input("You: ")
         if query.lower() in ["exit", "quit"]:
             break
-        result = process_query(query, frontend_location=None)
+        frontend_location = None
+        result = process_query(query, frontend_location=frontend_location)
         print(json.dumps(result, indent=2, ensure_ascii=False))
